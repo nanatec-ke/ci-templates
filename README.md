@@ -121,8 +121,9 @@ Per environment, set:
 | --- | --- |
 | `DEPLOY_HOST` | Target server hostname/IP for this environment |
 | `DEPLOY_USER` | SSH user that owns `deploy_path` and the PM2 daemon |
-| `DEPLOY_SSH_KEY` | Private key authorised for `DEPLOY_USER` on that server |
-| `DEPLOY_KNOWN_HOSTS` | Output of `ssh-keyscan <host>` (pins the host key) |
+| `DEPLOY_SSH_KEY` | Private key authorised for `DEPLOY_USER` (key auth) |
+| `DEPLOY_PASSWORD` | SSH password (only if `auth_method: password`) |
+| `DEPLOY_KNOWN_HOSTS` | Output of `ssh-keyscan <host>` (pins the host key; always required) |
 | `BUILD_DOTENV` | *(optional)* full `.env`, only if `dotenv_source: secret` |
 
 By default (`dotenv_source: server`) the build env is pulled from the server's
@@ -140,6 +141,42 @@ ssh-keyscan <host>                               # paste into DEPLOY_KNOWN_HOSTS
 ```
 
 Enable *production → Required reviewers* if you want a manual gate before prod.
+
+### Servers that only allow password auth
+
+`ssh`/`scp`/`rsync` can't take a password from a flag or env var on their own, so
+the template uses [`sshpass`](https://linux.die.net/man/1/sshpass) when you set
+`auth_method: password`. For such a server:
+
+1. Install `sshpass` on the self-hosted runner once: `sudo apt-get install -y sshpass`.
+2. Add a `DEPLOY_PASSWORD` secret (instead of `DEPLOY_SSH_KEY`) to that environment.
+3. In the caller, pass `auth_method: password`. `DEPLOY_KNOWN_HOSTS` is still
+   required — the host key is pinned regardless of auth method.
+
+```yaml
+    with:
+      app_name: azil-frontend
+      environment: production
+      deploy_path: /opt/azil/frontend/AZIL-FRONTEND
+      auth_method: password
+    secrets: inherit
+```
+
+The password is passed to `sshpass -e` via the `SSHPASS` env var, so it never
+appears on a command line (`ps` can't see it) or in the logs (Actions masks the
+secret). Auth method can differ per environment with an expression, e.g.
+`auth_method: ${{ github.ref_name == 'main' && 'key' || 'password' }}`.
+
+> **Strongly prefer keys.** A password grants a full interactive shell, can't be
+> scoped with a forced command, is awkward to rotate, and needs `sshpass` on the
+> runner. If you can SSH in even once, bootstrap a key and never use the password
+> again:
+>
+> ```bash
+> ssh-keygen -t ed25519 -f deploy_key -N ""
+> ssh-copy-id -i deploy_key.pub <user>@<host>   # prompts for the password this one time
+> # then store deploy_key as DEPLOY_SSH_KEY and use auth_method: key
+> ```
 
 ---
 
@@ -203,6 +240,7 @@ The full files are in each repo at `.github/workflows/ci-cd.yml`.
 | `bun_version` | `1.2.13` | Used when `package_manager=bun` |
 | `runs_on` | `["self-hosted","linux"]` | Runner label selector (JSON array) |
 | `dotenv_source` | `server` | `server` (scp `shared/.env`) \| `secret` (`BUILD_DOTENV`) \| `none` |
+| `auth_method` | `key` | `key` (`DEPLOY_SSH_KEY`) \| `password` (`DEPLOY_PASSWORD` via sshpass) |
 | `keep_releases` | `5` | Releases retained on the server for rollback |
 | `health_url` | `""` | Optional post-deploy curl; non-2xx fails the deploy |
 
