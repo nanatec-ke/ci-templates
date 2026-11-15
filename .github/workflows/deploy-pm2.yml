@@ -125,12 +125,14 @@ jobs:
         with:
           bun-version: ${{ inputs.bun_version }}
 
+      # Node is always set up, even for Bun projects: Astro builds run under
+      # Node (node node_modules/.bin/astro build) to avoid Bun's react-dom
+      # server.bun.js SSR crash. npm cache only applies to npm projects.
       - name: Set up Node
-        if: inputs.package_manager != 'bun'
         uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node_version }}
-          cache: npm
+          cache: ${{ inputs.package_manager == 'npm' && 'npm' || '' }}
 
       - name: Configure SSH
         env:
