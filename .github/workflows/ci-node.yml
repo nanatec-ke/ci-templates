@@ -1,0 +1,99 @@
+# Reusable CI workflow — install, check, and build. No secrets, no deploy.
+#
+# Runs on pull requests (and pushes, before deploy) to catch breakage early.
+# Astro builds with its PUBLIC_* fallbacks when no .env is present, so this is a
+# true compile/typecheck gate without needing any server access.
+
+name: ci-node
+
+on:
+  workflow_call:
+    inputs:
+      package_manager:
+        description: "bun | npm."
+        required: false
+        type: string
+        default: bun
+      build_command:
+        description: "Override the build command. Defaults to '<pm> run build'."
+        required: false
+        type: string
+        default: ""
+      node_version:
+        required: false
+        type: string
+        default: "22"
+      bun_version:
+        required: false
+        type: string
+        default: "1.2.13"
+      runs_on:
+        description: 'JSON array of runner labels.'
+        required: false
+        type: string
+        default: '["self-hosted","linux"]'
+      run_format_check:
+        description: "Run `<pm> run format:check` if the script exists."
+        required: false
+        type: boolean
+        default: true
+      run_typecheck:
+        description: "Run `<pm> run typecheck` if the script exists."
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    env:
+      PM: ${{ inputs.package_manager }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        if: inputs.package_manager == 'bun'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun_version }}
+
+      - name: Set up Node
+        if: inputs.package_manager != 'bun'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          if [ "$PM" = "bun" ]; then bun install --frozen-lockfile; else npm ci; fi
+
+      - name: Format check
+        if: inputs.run_format_check
+        run: |
+          set -euo pipefail
+          # Detect the script first so a genuine failure still fails the job
+          # (running it blind can't tell "missing script" from "check failed").
+          if grep -qE '"format:check"[[:space:]]*:' package.json; then
+            "$PM" run format:check
+          else
+            echo "::notice::no format:check script, skipping"
+          fi
+
+      - name: Typecheck
+        if: inputs.run_typecheck
+        run: |
+          set -euo pipefail
+          if grep -qE '"typecheck"[[:space:]]*:' package.json; then
+            "$PM" run typecheck
+          else
+            echo "::notice::no typecheck script, skipping"
+          fi
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          CMD="${{ inputs.build_command }}"
+          if [ -z "$CMD" ]; then CMD="$PM run build"; fi
+          $CMD
