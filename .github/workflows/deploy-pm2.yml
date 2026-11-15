@@ -72,12 +72,20 @@ on:
         required: false
         type: string
         default: ""
+      auth_method:
+        description: "SSH auth to the target: key (DEPLOY_SSH_KEY) | password (DEPLOY_PASSWORD, via sshpass). Prefer key."
+        required: false
+        type: string
+        default: key
     secrets:
       DEPLOY_SSH_KEY:
-        description: "Private key authorised on the target server for DEPLOY_USER."
-        required: true
+        description: "Private key authorised on the server. Required when auth_method=key."
+        required: false
+      DEPLOY_PASSWORD:
+        description: "SSH password for DEPLOY_USER. Required when auth_method=password (needs sshpass on the runner)."
+        required: false
       DEPLOY_KNOWN_HOSTS:
-        description: "Pinned host keys (output of ssh-keyscan on the server)."
+        description: "Pinned host keys (output of ssh-keyscan on the server). Always required."
         required: true
       DEPLOY_HOST:
         description: "Target server hostname/IP for this environment."
@@ -105,6 +113,9 @@ jobs:
       KEEP: ${{ inputs.keep_releases }}
       DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      # Consumed by `sshpass -e` when auth_method=password; empty (and unused)
+      # for key auth. Passed via env so it is never on a command line or in logs.
+      SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -125,23 +136,45 @@ jobs:
         env:
           SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          AUTH: ${{ inputs.auth_method }}
         run: |
           set -euo pipefail
           install -d -m 700 "$RUNNER_TEMP/ssh"
-          printf '%s\n' "$SSH_KEY"     > "$RUNNER_TEMP/ssh/key";  chmod 600 "$RUNNER_TEMP/ssh/key"
-          printf '%s\n' "$KNOWN_HOSTS" > "$RUNNER_TEMP/ssh/known_hosts"
+          KH="$RUNNER_TEMP/ssh/known_hosts"
+          printf '%s\n' "$KNOWN_HOSTS" > "$KH"
+          # Host-key pinning applies to both auth methods.
+          BASE_OPTS="-o UserKnownHostsFile=$KH -o StrictHostKeyChecking=yes"
+          # Build the ssh/scp/rsync-shell commands once and hand them to later
+          # steps via $GITHUB_ENV (shell vars don't persist across steps).
+          if [ "$AUTH" = "password" ]; then
+            command -v sshpass >/dev/null 2>&1 || {
+              echo "::error::auth_method=password requires sshpass on the runner (e.g. 'sudo apt-get install -y sshpass')."; exit 1; }
+            [ -n "${SSHPASS:-}" ] || { echo "::error::auth_method=password but DEPLOY_PASSWORD secret is empty."; exit 1; }
+            # Force password auth so ssh doesn't silently fall through to a key.
+            PW_OPTS="$BASE_OPTS -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no"
+            printf 'SSH_CMD=sshpass -e ssh %s\n'  "$PW_OPTS" >> "$GITHUB_ENV"
+            printf 'SCP_CMD=sshpass -e scp %s\n'  "$PW_OPTS" >> "$GITHUB_ENV"
+            printf 'RSH_CMD=sshpass -e ssh %s\n'  "$PW_OPTS" >> "$GITHUB_ENV"
+          else
+            [ -n "$SSH_KEY" ] || { echo "::error::auth_method=key but DEPLOY_SSH_KEY secret is empty."; exit 1; }
+            printf '%s\n' "$SSH_KEY" > "$RUNNER_TEMP/ssh/key"; chmod 600 "$RUNNER_TEMP/ssh/key"
+            KEY_OPTS="-i $RUNNER_TEMP/ssh/key $BASE_OPTS -o BatchMode=yes"
+            printf 'SSH_CMD=ssh %s\n' "$KEY_OPTS" >> "$GITHUB_ENV"
+            printf 'SCP_CMD=scp %s\n' "$KEY_OPTS" >> "$GITHUB_ENV"
+            printf 'RSH_CMD=ssh %s\n' "$KEY_OPTS" >> "$GITHUB_ENV"
+          fi
 
       - name: Fetch build-time .env
         env:
           BUILD_DOTENV: ${{ secrets.BUILD_DOTENV }}
         run: |
           set -euo pipefail
-          SSHOPTS="-i $RUNNER_TEMP/ssh/key -o UserKnownHostsFile=$RUNNER_TEMP/ssh/known_hosts -o StrictHostKeyChecking=yes"
           case "${{ inputs.dotenv_source }}" in
             server)
               # The server is the single source of truth for env. Astro inlines
               # every PUBLIC_* at BUILD time, so we need it here, not just at runtime.
-              scp $SSHOPTS "$DEPLOY_USER@$DEPLOY_HOST:$BASE/shared/.env" ./.env ;;
+              # $SCP_CMD is ssh-key or sshpass+password depending on auth_method.
+              $SCP_CMD "$DEPLOY_USER@$DEPLOY_HOST:$BASE/shared/.env" ./.env ;;
             secret)
               printf '%s\n' "$BUILD_DOTENV" > ./.env ;;
             none)
@@ -165,17 +198,17 @@ jobs:
       - name: Ship release and reload PM2
         run: |
           set -euo pipefail
-          SSHOPTS=(-i "$RUNNER_TEMP/ssh/key" -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" -o StrictHostKeyChecking=yes)
           TARGET="$DEPLOY_USER@$DEPLOY_HOST"
           REL="$BASE/releases/$SHA"
+          # $SSH_CMD / $RSH_CMD were set by "Configure SSH" (key or password auth).
 
           # 1. Make sure the release layout exists.
-          ssh "${SSHOPTS[@]}" "$TARGET" "mkdir -p '$BASE/releases' '$BASE/shared' '$REL/logs'"
+          $SSH_CMD "$TARGET" "mkdir -p '$BASE/releases' '$BASE/shared' '$REL/logs'"
 
           # 2. Sync the built tree into the new release. Exclude heavy/local-only
           #    dirs and never clobber the server-owned runtime .env.
           rsync -az --delete \
-            -e "ssh ${SSHOPTS[*]}" \
+            -e "$RSH_CMD" \
             --exclude '.git' \
             --exclude 'node_modules' \
             --exclude '.turbo' \
@@ -183,7 +216,7 @@ jobs:
             ./ "$TARGET:$REL/"
 
           # 3. Finalize on the server: prod deps, flip `current`, reload PM2, prune.
-          ssh "${SSHOPTS[@]}" "$TARGET" "PM='$PM' BASE='$BASE' SHA='$SHA' KEEP='$KEEP' bash -s" <<'REMOTE'
+          $SSH_CMD "$TARGET" "PM='$PM' BASE='$BASE' SHA='$SHA' KEEP='$KEEP' bash -s" <<'REMOTE'
           set -euo pipefail
           export PM2_HOME="${PM2_HOME:-$HOME/.pm2}"
           REL="$BASE/releases/$SHA"
