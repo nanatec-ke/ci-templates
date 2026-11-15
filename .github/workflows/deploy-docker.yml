@@ -1,0 +1,56 @@
+# Alternative deploy path for repos that ship a container instead of a PM2
+# process. PM2 is the primary method (see deploy-pm2.yml); this is kept for
+# services that are already Dockerized.
+name: deploy-docker
+on:
+  workflow_call:
+    inputs:
+      app_name:    { required: true, type: string }
+      environment: { required: true, type: string }
+      context:     { required: false, type: string, default: "." }
+      runs_on:     { required: false, type: string, default: '["self-hosted","linux"]' }
+
+jobs:
+  build:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    permissions: { contents: read, packages: write }
+    outputs:
+      tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    environment: ${{ inputs.environment }}
+    concurrency:                      # never two deploys of the same app/env at once
+      group: deploy-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Deploy over SSH
+        env:
+          SSH_KEY:     ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          HOST:        ${{ secrets.DEPLOY_HOST }}
+          USER:        ${{ secrets.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/deploy_key"; KH="$RUNNER_TEMP/known_hosts"
+          trap 'rm -f "$KEY" "$KH"' EXIT          # never leave keys on a persistent runner
+          printf '%s\n' "$SSH_KEY" > "$KEY"; chmod 600 "$KEY"
+          printf '%s\n' "$KNOWN_HOSTS" > "$KH"
+          ssh -i "$KEY" -o UserKnownHostsFile="$KH" -o StrictHostKeyChecking=yes \
+              "$USER@$HOST" "${{ inputs.app_name }} ${{ needs.build.outputs.tag }}"
