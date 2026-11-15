@@ -1,0 +1,218 @@
+# Reusable deploy workflow — build on the shared runner, ship over SSH, run with PM2.
+#
+# The runner that executes this is NOT the target server: it builds the app,
+# then rsyncs the release to the app's own host and reloads PM2 there. One
+# template serves every repo (single app or monorepo); the PM2 ecosystem file
+# in each repo decides how many processes run and on which ports.
+#
+# Release layout created on each server (Capistrano-style, atomic + rollbackable):
+#
+#   <deploy_path>/
+#   ├── shared/.env            # runtime secrets, owned by the server, never shipped
+#   ├── releases/<sha>/        # one dir per deploy; current points at the live one
+#   └── current -> releases/<sha>
+#
+# PM2 is always started from <deploy_path>/current/ecosystem.config.cjs, so a
+# rollback is just re-pointing `current` and reloading (see README).
+
+name: deploy-pm2
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "Logical app name (used for the release dir and PM2 namespace)."
+        required: true
+        type: string
+      environment:
+        description: "GitHub Environment to deploy to (production | staging). Gates secrets + approvals."
+        required: true
+        type: string
+      deploy_path:
+        description: "Base directory on the target server, e.g. /opt/azil/frontend/AZIL-FRONTEND."
+        required: true
+        type: string
+      package_manager:
+        description: "bun | npm — selects install/build defaults and the server-side prod install."
+        required: false
+        type: string
+        default: bun
+      build_command:
+        description: "Override the build command. Defaults to '<pm> run build'."
+        required: false
+        type: string
+        default: ""
+      node_version:
+        description: "Node version for the runtime (PM2 runs node on the server; build also needs it for npm projects)."
+        required: false
+        type: string
+        default: "22"
+      bun_version:
+        description: "Bun version when package_manager=bun."
+        required: false
+        type: string
+        default: "1.2.13"
+      runs_on:
+        description: 'JSON array of runner labels, e.g. ["self-hosted","linux"].'
+        required: false
+        type: string
+        default: '["self-hosted","linux"]'
+      dotenv_source:
+        description: "Where the BUILD-time .env comes from: server (scp from <deploy_path>/shared/.env) | secret (BUILD_DOTENV) | none."
+        required: false
+        type: string
+        default: server
+      keep_releases:
+        description: "How many old releases to retain on the server for rollback."
+        required: false
+        type: number
+        default: 5
+      health_url:
+        description: "Optional URL curled after reload; a non-2xx fails the deploy."
+        required: false
+        type: string
+        default: ""
+    secrets:
+      DEPLOY_SSH_KEY:
+        description: "Private key authorised on the target server for DEPLOY_USER."
+        required: true
+      DEPLOY_KNOWN_HOSTS:
+        description: "Pinned host keys (output of ssh-keyscan on the server)."
+        required: true
+      DEPLOY_HOST:
+        description: "Target server hostname/IP for this environment."
+        required: true
+      DEPLOY_USER:
+        description: "SSH user that owns the deploy_path and the PM2 daemon."
+        required: true
+      BUILD_DOTENV:
+        description: "Full .env contents, used only when dotenv_source=secret."
+        required: false
+
+jobs:
+  deploy:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    environment: ${{ inputs.environment }}
+    # Never let two deploys of the same app+environment race on the server.
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      PM: ${{ inputs.package_manager }}
+      APP: ${{ inputs.app_name }}
+      BASE: ${{ inputs.deploy_path }}
+      SHA: ${{ github.sha }}
+      KEEP: ${{ inputs.keep_releases }}
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bun
+        if: inputs.package_manager == 'bun'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun_version }}
+
+      - name: Set up Node
+        if: inputs.package_manager != 'bun'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$RUNNER_TEMP/ssh"
+          printf '%s\n' "$SSH_KEY"     > "$RUNNER_TEMP/ssh/key";  chmod 600 "$RUNNER_TEMP/ssh/key"
+          printf '%s\n' "$KNOWN_HOSTS" > "$RUNNER_TEMP/ssh/known_hosts"
+
+      - name: Fetch build-time .env
+        env:
+          BUILD_DOTENV: ${{ secrets.BUILD_DOTENV }}
+        run: |
+          set -euo pipefail
+          SSHOPTS="-i $RUNNER_TEMP/ssh/key -o UserKnownHostsFile=$RUNNER_TEMP/ssh/known_hosts -o StrictHostKeyChecking=yes"
+          case "${{ inputs.dotenv_source }}" in
+            server)
+              # The server is the single source of truth for env. Astro inlines
+              # every PUBLIC_* at BUILD time, so we need it here, not just at runtime.
+              scp $SSHOPTS "$DEPLOY_USER@$DEPLOY_HOST:$BASE/shared/.env" ./.env ;;
+            secret)
+              printf '%s\n' "$BUILD_DOTENV" > ./.env ;;
+            none)
+              echo "No .env fetched (dotenv_source=none)." ;;
+            *)
+              echo "::error::Unknown dotenv_source '${{ inputs.dotenv_source }}'"; exit 1 ;;
+          esac
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          if [ "$PM" = "bun" ]; then bun install --frozen-lockfile; else npm ci; fi
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          CMD="${{ inputs.build_command }}"
+          if [ -z "$CMD" ]; then CMD="$PM run build"; fi
+          NODE_ENV=production $CMD
+
+      - name: Ship release and reload PM2
+        run: |
+          set -euo pipefail
+          SSHOPTS=(-i "$RUNNER_TEMP/ssh/key" -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" -o StrictHostKeyChecking=yes)
+          TARGET="$DEPLOY_USER@$DEPLOY_HOST"
+          REL="$BASE/releases/$SHA"
+
+          # 1. Make sure the release layout exists.
+          ssh "${SSHOPTS[@]}" "$TARGET" "mkdir -p '$BASE/releases' '$BASE/shared' '$REL/logs'"
+
+          # 2. Sync the built tree into the new release. Exclude heavy/local-only
+          #    dirs and never clobber the server-owned runtime .env.
+          rsync -az --delete \
+            -e "ssh ${SSHOPTS[*]}" \
+            --exclude '.git' \
+            --exclude 'node_modules' \
+            --exclude '.turbo' \
+            --exclude '.env' \
+            ./ "$TARGET:$REL/"
+
+          # 3. Finalize on the server: prod deps, flip `current`, reload PM2, prune.
+          ssh "${SSHOPTS[@]}" "$TARGET" "PM='$PM' BASE='$BASE' SHA='$SHA' KEEP='$KEEP' bash -s" <<'REMOTE'
+          set -euo pipefail
+          export PM2_HOME="${PM2_HOME:-$HOME/.pm2}"
+          REL="$BASE/releases/$SHA"
+          cd "$REL"
+          if [ "$PM" = "bun" ]; then
+            bun install --frozen-lockfile --production
+          else
+            npm ci --omit=dev
+          fi
+          # Link the shared runtime env and logs into the release.
+          [ -f "$BASE/shared/.env" ] && ln -sfn "$BASE/shared/.env" "$REL/.env"
+          # Atomically promote this release.
+          ln -sfn "$REL" "$BASE/current"
+          cd "$BASE/current"
+          pm2 startOrReload ecosystem.config.cjs --env production
+          pm2 save
+          # Keep the newest $KEEP releases, drop the rest (|| true so an empty
+          # glob never trips pipefail).
+          { ls -1dt "$BASE"/releases/*/ 2>/dev/null || true; } | tail -n +$((KEEP+1)) | xargs -r rm -rf
+          echo "Deployed $SHA -> $(readlink -f "$BASE/current")"
+          REMOTE
+
+      - name: Health check
+        if: inputs.health_url != ''
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 5 --retry-delay 3 --max-time 15 "${{ inputs.health_url }}" > /dev/null
+          echo "Health check passed: ${{ inputs.health_url }}"
+
+      - name: Remove SSH key from runner
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/ssh"
