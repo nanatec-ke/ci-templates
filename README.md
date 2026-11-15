@@ -107,6 +107,22 @@ not registration, so either approach works with no workflow change.
 > one org) so a single enterprise runner group serves everything and the
 > templates repo can stay private.
 
+### Runner prerequisites
+
+A bare self-hosted runner is missing tools that GitHub-hosted runners ship with.
+The workflows need: `unzip` (`setup-bun` extracts Bun from a `.zip`), `rsync`
+(deploy ships releases), `openssh-client`, `sshpass` (only for
+`auth_method: password`), plus `curl`/`tar`/`git`. Provision each runner **once**
+(run as root):
+
+```bash
+./scripts/runner-bootstrap.sh          # or: sudo apt-get install -y unzip rsync openssh-client sshpass curl tar git
+```
+
+`node`/`pm2` are **not** needed on the runner — they run on the deploy servers
+(see [`server-bootstrap.sh`](scripts/server-bootstrap.sh)). The runner only
+builds and ships.
+
 ---
 
 ## Secrets & GitHub Environments

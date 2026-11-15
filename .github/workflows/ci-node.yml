@@ -26,7 +26,10 @@ on:
       bun_version:
         required: false
         type: string
-        default: "1.2.13"
+        # 1.2.13 hit a Bun runtime bug loading react-dom/server.bun.js during
+        # Astro SSR builds ("Expected CommonJS module to have a function
+        # wrapper"). 1.3.11 builds cleanly. Bump deliberately.
+        default: "1.3.11"
       runs_on:
         description: 'JSON array of runner labels.'
         required: false
