@@ -221,6 +221,17 @@ jobs:
           $SSH_CMD "$TARGET" "PM='$PM' BASE='$BASE' SHA='$SHA' KEEP='$KEEP' bash -s" <<'REMOTE'
           set -euo pipefail
           export PM2_HOME="${PM2_HOME:-$HOME/.pm2}"
+          # A non-interactive SSH session does not source ~/.bashrc, so
+          # user-installed toolchains (bun, nvm-managed node, pm2) are not on
+          # PATH. Make them resolvable here. System installs and /usr/local/bin
+          # symlinks are already covered by the inherited PATH.
+          export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"
+          PATH="/usr/local/bin:$BUN_INSTALL/bin:$HOME/.local/bin:$PATH"
+          # nvm-managed node/pm2 (newest installed version wins); best effort.
+          if [ -d "$HOME/.nvm/versions/node" ]; then
+            for d in "$HOME"/.nvm/versions/node/*/bin; do [ -d "$d" ] && PATH="$d:$PATH"; done
+          fi
+          export PATH
           REL="$BASE/releases/$SHA"
           cd "$REL"
           if [ "$PM" = "bun" ]; then
