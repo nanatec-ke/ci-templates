@@ -1,0 +1,135 @@
+# Reusable rollback — re-point `current` at a previous release and restart PM2.
+#
+# No build, no rsync: it just flips the symlink to an already-shipped release
+# under <deploy_path>/releases/ and restarts the app. That makes rollback near
+# instant (seconds), which is the whole point of keeping old releases.
+#
+# Trigger it from a repo via workflow_dispatch (see README). Leave `release`
+# empty to roll back to the release immediately before the current one, or pass
+# a specific <sha> (a dir name under releases/) to target it exactly.
+
+name: rollback-pm2
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "GitHub Environment to roll back (production | staging)."
+        required: true
+        type: string
+      deploy_path:
+        description: "Base dir on the server, e.g. /opt/emaginet-frontend."
+        required: true
+        type: string
+      release:
+        description: "Release to roll back to (a dir name under releases/, usually a commit SHA). Empty = the previous release."
+        required: false
+        type: string
+        default: ""
+      auth_method:
+        description: "key (DEPLOY_SSH_KEY) | password (DEPLOY_PASSWORD, via sshpass)."
+        required: false
+        type: string
+        default: key
+      runs_on:
+        required: false
+        type: string
+        default: '["self-hosted","linux"]'
+      health_url:
+        description: "Optional URL curled after rollback; non-2xx fails the job."
+        required: false
+        type: string
+        default: ""
+    secrets:
+      DEPLOY_SSH_KEY:     { required: false }
+      DEPLOY_PASSWORD:    { required: false }
+      DEPLOY_KNOWN_HOSTS: { required: true }
+      DEPLOY_HOST:        { required: true }
+      DEPLOY_USER:        { required: true }
+
+jobs:
+  rollback:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ inputs.environment }}   # shares the deploy lock: never roll back mid-deploy
+      cancel-in-progress: false
+    env:
+      BASE: ${{ inputs.deploy_path }}
+      RELEASE: ${{ inputs.release }}
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      SSHPASS: ${{ secrets.DEPLOY_PASSWORD }}
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          AUTH: ${{ inputs.auth_method }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$RUNNER_TEMP/ssh"
+          KH="$RUNNER_TEMP/ssh/known_hosts"
+          printf '%s\n' "$KNOWN_HOSTS" > "$KH"
+          BASE_OPTS="-o UserKnownHostsFile=$KH -o StrictHostKeyChecking=yes"
+          if [ "$AUTH" = "password" ]; then
+            command -v sshpass >/dev/null 2>&1 || { echo "::error::auth_method=password needs sshpass on the runner."; exit 1; }
+            [ -n "${SSHPASS:-}" ] || { echo "::error::DEPLOY_PASSWORD is empty."; exit 1; }
+            PW_OPTS="$BASE_OPTS -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no"
+            printf 'SSH_CMD=sshpass -e ssh %s\n' "$PW_OPTS" >> "$GITHUB_ENV"
+          else
+            [ -n "$SSH_KEY" ] || { echo "::error::auth_method=key but DEPLOY_SSH_KEY is empty."; exit 1; }
+            printf '%s\n' "$SSH_KEY" > "$RUNNER_TEMP/ssh/key"; chmod 600 "$RUNNER_TEMP/ssh/key"
+            printf 'SSH_CMD=ssh -i %s %s -o BatchMode=yes\n' "$RUNNER_TEMP/ssh/key" "$BASE_OPTS" >> "$GITHUB_ENV"
+          fi
+
+      - name: Roll back and restart PM2
+        run: |
+          set -euo pipefail
+          TARGET="$DEPLOY_USER@$DEPLOY_HOST"
+          $SSH_CMD "$TARGET" "BASE='$BASE' RELEASE='$RELEASE' bash -s" <<'REMOTE'
+          set -euo pipefail
+          export PM2_HOME="${PM2_HOME:-$HOME/.pm2}"
+          # Same toolchain PATH resolution as the deploy.
+          export BUN_INSTALL="${BUN_INSTALL:-$HOME/.bun}"
+          PATH="/usr/local/bin:$BUN_INSTALL/bin:$HOME/.local/bin:$PATH"
+          if [ -d "$HOME/.nvm/versions/node" ]; then
+            for d in "$HOME"/.nvm/versions/node/*/bin; do [ -d "$d" ] && PATH="$d:$PATH"; done
+          fi
+          export PATH
+          cd "$BASE"
+          CUR="$(readlink -f current 2>/dev/null || true)"
+          if [ -n "$RELEASE" ]; then
+            DEST="$BASE/releases/$RELEASE"
+          else
+            # Previous = newest release dir that isn't the one 'current' points at.
+            DEST=""
+            for d in $(ls -1dt releases/*/ 2>/dev/null); do
+              real="$(readlink -f "$d")"
+              [ "$real" != "$CUR" ] && { DEST="$real"; break; }
+            done
+          fi
+          if [ -z "$DEST" ] || [ ! -d "$DEST" ]; then
+            echo "::error::rollback target not found (release='$RELEASE')"
+            echo "available releases:"; ls -1dt "$BASE"/releases/ 2>/dev/null || true
+            exit 1
+          fi
+          echo "Rolling back: $CUR -> $DEST"
+          ln -sfn "$DEST" "$BASE/current"
+          cd "$BASE/current"
+          pm2 delete ecosystem.config.cjs >/dev/null 2>&1 || true
+          pm2 start ecosystem.config.cjs --env production
+          pm2 save
+          echo "Rolled back to $(readlink -f "$BASE/current")"
+          REMOTE
+
+      - name: Health check
+        if: inputs.health_url != ''
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 5 --retry-delay 3 --max-time 15 "${{ inputs.health_url }}" > /dev/null
+          echo "Health check passed: ${{ inputs.health_url }}"
+
+      - name: Remove SSH key from runner
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/ssh"

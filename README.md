@@ -13,7 +13,8 @@ and ships the release to the app's server over SSH.
 ## Contents
 
 - [`ci-node.yml`](.github/workflows/ci-node.yml) — install, format-check, typecheck, build. No secrets. For PRs and pre-deploy validation.
-- [`deploy-pm2.yml`](.github/workflows/deploy-pm2.yml) — build on the runner, ship over SSH, reload PM2. **The main deploy template.**
+- [`deploy-pm2.yml`](.github/workflows/deploy-pm2.yml) — build on the runner, ship over SSH, restart PM2. **The main deploy template.**
+- [`rollback-pm2.yml`](.github/workflows/rollback-pm2.yml) — flip `current` to a previous release and restart PM2 (no rebuild). Triggered on demand.
 - [`deploy-docker.yml`](.github/workflows/deploy-docker.yml) — alternative for repos that ship a container.
 - [`scripts/server-bootstrap.sh`](scripts/server-bootstrap.sh) — prepares a server's release layout, run once per app/host.
 
@@ -264,17 +265,56 @@ The full files are in each repo at `.github/workflows/ci-cd.yml`.
 
 ## Rollback
 
-List releases and re-point `current` on the server, then reload:
+Every deploy keeps the last `keep_releases` builds under `releases/<sha>/`, so a
+rollback is a symlink flip + restart — **no rebuild**. Three ways, fastest first:
+
+### 1. One-click pipeline rollback (recommended)
+
+Add a `workflow_dispatch` job to the repo (a separate `.github/workflows/rollback.yml`)
+that calls [`rollback-pm2.yml`](.github/workflows/rollback-pm2.yml):
+
+```yaml
+name: Rollback
+on:
+  workflow_dispatch:
+    inputs:
+      environment: { description: production or staging, required: true, default: staging }
+      release:     { description: "release <sha> to roll back to (blank = previous)", required: false }
+jobs:
+  rollback:
+    uses: nanatec-ke/ci-templates/.github/workflows/rollback-pm2.yml@v1
+    with:
+      environment: ${{ inputs.environment }}
+      deploy_path: /opt/emaginet-frontend        # same as your deploy caller
+      release:     ${{ inputs.release }}
+      auth_method: ${{ inputs.environment == 'production' && 'key' || 'password' }}
+    secrets: inherit
+```
+
+Trigger it from **Actions → Rollback → Run workflow**: pick the environment, and
+either leave `release` blank (rolls back to the release before the current one)
+or paste a specific `<sha>` to target it. It flips `current` and restarts PM2
+(scoped to that repo's apps) in seconds — no build.
+
+> To see which releases exist: `ls -1dt /opt/<app>/releases/` on the server.
+
+### 2. Re-run the last good deploy
+
+In the Actions UI, open the last green deploy run and **Re-run all jobs**. It
+checks out that commit, rebuilds, and redeploys. Slower (full build) but needs no
+extra workflow — good when the bad release has already been pruned.
+
+### 3. Manual, on the server (emergency)
 
 ```bash
 cd /opt/<app>
 ls -1dt releases/*/              # newest first; pick the known-good <sha>
 ln -sfn "releases/<good-sha>" current
-cd current && PM2_HOME=$HOME/.pm2 pm2 startOrReload ecosystem.config.cjs --env production
+cd current && PM2_HOME=$HOME/.pm2 \
+  sh -c 'pm2 delete ecosystem.config.cjs 2>/dev/null; pm2 start ecosystem.config.cjs --env production && pm2 save'
 ```
 
-Because old releases are kept (`keep_releases`), rollback is a symlink flip — no
-rebuild. To roll forward, just re-run the deploy on the good commit.
+`delete + start` (not `reload`) so PM2 adopts the rolled-back release's path.
 
 ---
 
