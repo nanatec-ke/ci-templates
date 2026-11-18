@@ -244,7 +244,13 @@ jobs:
           # Atomically promote this release.
           ln -sfn "$REL" "$BASE/current"
           cd "$BASE/current"
-          pm2 startOrReload ecosystem.config.cjs --env production
+          # Delete and re-start only THIS ecosystem's apps (scoped by the names
+          # in the file — never other projects on the shared daemon) so PM2
+          # adopts the new release's script paths. A plain reload keeps the path
+          # the process was first started with and would serve stale code; these
+          # apps run in fork mode, so reload isn't zero-downtime anyway.
+          pm2 delete ecosystem.config.cjs >/dev/null 2>&1 || true
+          pm2 start ecosystem.config.cjs --env production
           pm2 save
           # Keep the newest $KEEP releases, drop the rest (|| true so an empty
           # glob never trips pipefail).
